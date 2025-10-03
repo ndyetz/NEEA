@@ -1,0 +1,392 @@
+---
+title: "NEEA Survey Program Manager Exercise"
+output: 
+  html_notebook:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+<center>![](neea_logo.png)</center>
+
+# Introduction
+This notebook was created on 10/01/2025 by Neil Yetz, M.P.H. The purpose of this notebook is to display how I would tackle a problem associated as a Survey Program manager at Northwest Energy Efficiency Alliance (NEEA).
+
+Data used from the 2022 Residential Building Stock Assessment (RBSA). Data user guide available here: https://neea.org/wp-content/uploads/2025/03/2022-RBSA-Data-User-Guide.pdf
+
+Dataset is available for request here: https://neea.org/resource/2022-residential-building-stock-assessment-datasets/
+
+
+# Load Libraries
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(readxl)
+library(psych)
+library(sf)
+library(usmap)
+library(kableExtra)
+library(DT)
+library(paletteer)
+```
+
+
+# Project Instructions
+```{r}
+instructions <- read_excel("EUS Survey Program Manager Survey Design Exercise.xlsx", sheet = 1, col_names = c("instructions_1", "instructions_2"))
+
+instructions <- instructions %>% 
+  mutate(instructions_1 = ifelse(!is.na(instructions_2), str_c(instructions_1, instructions_2, sep = " "), instructions_1)) %>% 
+  select(instructions = "instructions_1")
+```
+
+```{r, rows.print= 100}
+instructions %>% 
+  datatable( 
+        rownames = FALSE,
+        options = list(
+        paging = FALSE,
+        scrollY = "400px")
+        )
+```
+
+# Data Dictionary
+```{r}
+dictionary <- read_excel("EUS Survey Program Manager Survey Design Exercise.xlsx", sheet = "Data Dictionary")
+```
+
+```{r}
+dictionary %>% 
+  mutate(column = rownames(dictionary)) %>% 
+  select(column, Variable, `Variable type`, `Variable Description / Question Text`) %>% 
+
+  datatable(class = 'cell-border stripe', 
+        rownames = FALSE,
+        options = list(
+        paging = FALSE,
+        scrollY = "400px")
+        )
+```
+
+# Read in Data
+```{r}
+#Mechanical One Line (mol) Data set
+mol <- read_excel("EUS Survey Program Manager Survey Design Exercise.xlsx", sheet = "Mechanical_One_Line", na = "Unknown") #NOTE: data containing "Unknown" is being converted to missing data. This helps keep numeric data as numeric (And reduces warnings)
+
+#Response Options for selected variables
+response <- read_excel("EUS Survey Program Manager Survey Design Exercise.xlsx", sheet = "Response List")
+```
+
+## Numeric Variable summary
+```{r}
+des_mol <- mol %>% 
+  select_if(is.numeric) %>% 
+  select(-Zip, -Site_Case_Weight) %>% 
+  describe(skew = FALSE) %>% 
+  mutate_if(is.numeric, .funs = round, 2) 
+
+des_mol %>% 
+  mutate(var_name = rownames(des_mol)) %>% 
+  select(var_name, everything()) %>% 
+  datatable(class = 'cell-border stripe', 
+        rownames = FALSE,
+        options = list(
+        paging = FALSE,
+        scrollY = "400px",
+        scrollX = "400px")
+        )
+```
+
+
+## Census Map Download
+Retrieve Shape Files from Census
+```{r}
+
+# Data Retrieved from census.gov. Based off of 2020 census
+temp_shapefile <- tempfile()
+download.file("https://www2.census.gov/geo/tiger/TIGER2022/ZCTA520/tl_2022_us_zcta520.zip", temp_shapefile)
+unzip(temp_shapefile)
+
+sf_zip <- read_sf('tl_2022_us_zcta520.shp')
+```
+
+
+### Filter file and merge sampled zip codes
+```{r}
+#get unique zip codes
+unique_zips <- mol %>% 
+  mutate(Zip = as.character(Zip)) %>% 
+  group_by(Zip) %>% 
+  summarize(n = n()) %>% 
+  ungroup() %>% 
+  select(-n)
+
+sf_zip_reduce <- sf_zip %>% 
+  right_join(unique_zips, by = c("ZCTA5CE20" = "Zip"))
+
+#Convert to sf polygon
+sf_zip_reduce_pol <-  st_geometry(sf_zip_reduce)
+
+#Get state and county outline for states of interest from usmap::us_map() package
+states_of_interest <- c("OR","WA", "ID", "MT")
+
+counties <- us_map(regions = "counties", include = states_of_interest)
+states   <- us_map(include = states_of_interest)
+
+#Convert counties and states into sf polygon
+counties_pol  <- st_geometry(counties)
+states_pol  <- st_geometry(states)
+```
+
+
+# Map 1: Sampled area
+```{r}
+# Create the map using ggplot2
+ggplot() +
+  geom_sf(data = counties_pol, fill = NA, color = "grey") + # Counties
+  geom_sf(data = sf_zip_reduce_pol, fill = 'lightblue', color = 'lightblue') +#Surveyed zip codes
+  geom_sf(data = states_pol, fill = NA, color = "black", linewidth = 1) + # State Lines
+  labs(title = "2022 RBSA Encachment Area", 
+       caption = "Source: 2020 US Census & 2022 RBSA survey") +
+  theme_void() 
+```
+
+# Data of interest set-up
+```{r}
+#Overall N
+n <- mol %>% 
+  summarize(n = n())
+
+# Building Type and Category n
+building_type <- mol %>% 
+  group_by(Building_Type, Building_Category) %>% 
+  summarize(n = n())
+
+# State n
+state <- mol %>% 
+  group_by(State) %>% 
+  summarize(n = n()) %>% 
+  mutate(State = ifelse(State == "ID", "Idaho", State),
+         State = ifelse(State == "MT", "Montana", State),
+         State = ifelse(State == "OR", "Oregon", State),
+         State = ifelse(State == "WA", "Washington", State),
+         
+         State = factor(State, levels = c("Montana", "Idaho", "Oregon", "Washington"), labels = c(1,2,3,4)),
+         State = factor(State, labels = c("Montana", "Idaho", "Oregon", "Washington"), levels = c(1,2,3,4)),
+)
+
+# Region n
+region <- mol %>% 
+  group_by(Region_SF_StrataVar) %>% 
+  summarize(n = n())
+
+# Urban vs Rural n
+urban <- mol %>% 
+  group_by(Urban_Rural) %>% 
+  summarize(n = n()) %>% 
+  mutate(total = sum(n),
+         `%` = round((n/ total)*100))
+
+# Home year n
+home_vintage <- mol %>% 
+  summarize(Home_vintage_mean = round(mean(Home_Vintage, na.rm = TRUE)),
+            Home_vintage_median = round(median(Home_Vintage, na.rm = TRUE)),
+            Home_vintage_sd = round(sd(Home_Vintage, na.rm = TRUE)),
+            Home_vintage_min = round(min(Home_Vintage, na.rm = TRUE)),
+            Home_vintage_max = round(max(Home_Vintage, na.rm = TRUE)))
+```
+
+
+# Plots & Tables of interest
+## State plot
+```{r}
+ggplot(state, aes(x = State, y = n, fill = State)) +
+  geom_col() +
+  labs(x = "", y = "") +
+  geom_text(aes(label = paste0(n), vjust = -0.5)) +
+  theme_minimal() +
+  scale_fill_hue(c = 40) +
+  theme(legend.position = "none") 
+```
+
+## Urbanicity plot
+```{r}
+ggplot(urban, aes(x = Urban_Rural, y = n, fill = Urban_Rural)) +
+  theme_minimal() +
+  geom_col() +
+  theme(legend.position = "none") +
+  labs(x = "", y = "") +
+  geom_text(aes(label = paste0(n, " (", `%`, "%)")), vjust = -0.5) +
+  scale_fill_hue(c = 40) 
+```
+
+## Building types table
+```{r}
+build_types <- mol %>% 
+  select(Building_Category) %>% 
+  group_by(Building_Category) %>% 
+  summarize(n = n()) %>% 
+  mutate(total = sum(n), 
+  `%` = round((n / total) * 100, 2)) %>%
+  select(-total) %>% 
+  arrange(n)
+
+build_types
+```
+## Collapse Buildtype categories
+```{r}
+build_types_collapsed <- mol %>% 
+  mutate(new_cat = ifelse(str_detect(Building_Category, "Manufactured") == TRUE, "Manufactured Home", NA),
+         new_cat = ifelse(str_detect(Building_Category, "Townhome") == TRUE, "Townhome", new_cat),
+         new_cat = ifelse(str_detect(Building_Category, "Apartment") == TRUE, "Apartment", new_cat),
+         new_cat = ifelse(str_detect(Building_Category, "Duplex") == TRUE, "Du/Tri/Fourplex", new_cat),
+         new_cat = ifelse(str_detect(Building_Category, "Single Family") == TRUE, "Single Family Detached", new_cat)
+         ) %>% 
+  select(-Building_Category) %>% 
+  select(Building_Category = "new_cat") %>% 
+  group_by(Building_Category) %>% 
+  summarize(n = n()) %>% 
+  mutate(total = sum(n), 
+  `%` = round((n / total) * 100, 2)) %>%
+  select(-total) %>% 
+  arrange(n) %>% 
+  mutate(Building_Category = factor(Building_Category, levels = c("Manufactured Home", "Townhome", "Du/Tri/Fourplex", "Apartment", "Single Family Detached"), labels = c(1,2,3,4,5)),
+         Building_Category = factor(Building_Category, labels = c("Manufactured Home", "Townhome", "Du/Tri/Fourplex", "Apartment", "Single Family Detached"), levels = c(1,2,3,4,5))
+         )
+```
+
+
+## Build type collapsed graph
+```{r}
+ggplot(build_types_collapsed, aes(x = Building_Category, y = n, fill = Building_Category)) +
+  scale_fill_manual(values = c("red", "grey", "grey", "grey", "grey")) +
+  theme_minimal() +
+  geom_col() +
+  theme(legend.position = "none") +
+  labs(x = "", y = "") +
+  geom_text(aes(label = paste0(n, " (", `%`, "%)")), vjust = -0.5)
+```
+
+# Manufactured Home analyses
+## Map 2: sampled Manufacture home area
+```{r}
+#Filter to only Manufactured homes
+manufactured <- mol %>% 
+  filter(str_detect(Building_Category, "Manufactured") == TRUE)
+
+#summarize manufactured home zip codes
+manufactured <- manufactured %>% 
+  mutate(Zip = as.character(Zip)) %>% 
+  group_by(Zip) %>% 
+  summarize(n = n()) %>% 
+  ungroup() %>% 
+  select(-n)
+
+#merge with geom data
+manufactured_zip <- sf_zip %>% 
+  right_join(manufactured, by = c("ZCTA5CE20" = "Zip"))
+```
+
+```{r}
+#Create sf polygon object
+manufactured_zip_pol <-  st_geometry(manufactured_zip)
+```
+
+```{r}
+# Create the plot using ggplot2
+ggplot() +
+  geom_sf(data = counties_pol, fill = NA, color = "grey") +
+  #geom_sf(data = sf_zip_reduce_pol, fill = 'lightblue', color = 'lightblue') +
+  geom_sf(data = manufactured_zip_pol, fill = 'red', color = 'red', show.legend = "area") +
+  geom_sf(data = states_pol, fill = NA, color = "black", linewidth = 1) +
+  theme_void() +
+  labs(#title = "2022 Manufactured home data collection", 
+       caption = "Source: 2020 US Census & 2022 RBSA survey")
+```
+
+
+## Manufactured and Rural Plot
+```{r}
+manufactured_state <- mol %>% 
+  filter(str_detect(Building_Category, "Manufactured") == TRUE) %>% 
+  mutate(Manufactured = TRUE) %>% 
+  group_by(State) %>% 
+  summarize(n = n())
+
+manufactured_state <- mol %>% 
+  filter(str_detect(Building_Category, "Manufactured") == TRUE) %>% 
+  mutate(Manufactured = TRUE) %>% 
+  group_by(State, Building_Category) %>% 
+  summarize(n = n())
+```
+```{r}
+manufactured_rurality <- mol %>% 
+  filter(str_detect(Building_Category, "Manufactured") == TRUE) %>% 
+  mutate(Manufactured = TRUE) %>% 
+  group_by(Urban_Rural) %>% 
+  summarize(n = n()) %>% 
+    mutate(total = sum(n), 
+  `%` = round((n / total) * 100, 2))
+```
+
+```{r}
+ggplot(manufactured_rurality, aes(x = Urban_Rural, y = n, fill = Urban_Rural)) +
+  theme_minimal() +
+  geom_col() +
+  theme(legend.position = "none") +
+  labs(x = "", y = "") +
+  geom_text(aes(label = paste0(n, " (", `%`, "%)")), vjust = -0.5) +
+  scale_fill_hue(c = 40) + 
+  ggtitle("Filtered by Manufactured Homes")
+```
+
+
+
+## Rural Urban Communities Continuum
+```{r}
+# Rucc downloaded from https://www.ers.usda.gov/topics/rural-economy-population/rural-classifications
+rucc <- read_excel("Ruralurbancontinuumcodes2023.xlsx", sheet = 1)
+
+# Filter RUCC
+rucc_pnw <- rucc %>% 
+  filter(State == "ID" | State == "OR" | State == "MT" | State == "WA") %>% 
+  filter(RUCC_2023 > 3) %>% 
+  select(fips = "FIPS")
+# Merge with counties
+rucc_pnw_rur <- counties %>% 
+  inner_join(rucc_pnw, by = "fips") %>% 
+  select(fips, geom)  
+
+#Convert to sf polygon
+rural_sp <- st_geometry(rucc_pnw_rur)
+
+
+# Get unique rural zips
+unique_rural_zips <- mol %>% 
+  filter(Urban_Rural == "Rural") %>% 
+  mutate(Zip = as.character(Zip)) %>% 
+  group_by(Zip) %>% 
+  summarize(n = n()) %>% 
+  ungroup() %>% 
+  select(-n)
+
+#Join with zip
+sf_rural_reduce <- sf_zip %>% 
+  right_join(unique_rural_zips, by = c("ZCTA5CE20" = "Zip"))
+
+#Convert to sf polygon
+sf_rural_reduce_pol <-  st_geometry(sf_rural_reduce)
+```
+
+## Map 3: all rural communities
+```{r}
+# Create the plot using ggplot2
+ggplot() +
+  geom_sf(data = counties_pol, fill = NA, color = "grey") +
+  geom_sf(data = rural_sp, fill = 'grey') +
+ # geom_sf(data = manufactured_zip_pol, fill = 'red', color = 'red') +
+  geom_sf(data = sf_rural_reduce_pol, fill = "darkgreen") +
+  geom_sf(data = states_pol, fill = NA, color = "black", linewidth = 1) +
+  theme_void() +
+  labs(#title = "2022 Manufactured home data collection", 
+       caption = "Source: 2020 US Census & 2022 RBSA survey & 2023 USDA ERS")
+```
